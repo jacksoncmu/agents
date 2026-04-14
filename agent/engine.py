@@ -6,6 +6,7 @@ from typing import Iterator
 
 from agent.llm.base import LLMProvider
 from agent.storage import LABEL_POST_LLM, LABEL_POST_TOOLS, Checkpoint, SessionStore
+from agent.telemetry import Outcome, emit as _emit
 from agent.tools import ExecutionResult, ToolRegistry
 from agent.types import (
     Message,
@@ -37,6 +38,27 @@ class AgentEngine:
         self.tools = tools
 
     # ------------------------------------------------------------------
+    # Ownership helpers (emit telemetry + delegate to store)
+    # ------------------------------------------------------------------
+
+    def _acquire_run(self, session_id: str) -> None:
+        """Claim run ownership.  Emits run.acquire (executed|blocked).
+
+        Raises ConcurrentRunError when another run already holds ownership.
+        """
+        if not self.store.try_acquire_run(session_id):
+            _emit("run.acquire", Outcome.blocked, session_id=session_id)
+            raise ConcurrentRunError(
+                f"Session {session_id} already has an active run."
+            )
+        _emit("run.acquire", Outcome.executed, session_id=session_id)
+
+    def _release_run(self, session_id: str) -> None:
+        """Release run ownership and emit run.release."""
+        self.store.release_run(session_id)
+        _emit("run.release", Outcome.executed, session_id=session_id)
+
+    # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
 
@@ -58,10 +80,7 @@ class AgentEngine:
         ``waiting_for_confirmation`` and this method returns an empty string.
         Call ``resume()`` to continue.
         """
-        if not self.store.try_acquire_run(session_id):
-            raise ConcurrentRunError(
-                f"Session {session_id} already has an active run."
-            )
+        self._acquire_run(session_id)
         try:
             session = self._require_session(session_id)
             self._assert_can_run(session)
@@ -70,7 +89,7 @@ class AgentEngine:
             self._transition(session, SessionState.running)
             self.store.save(session)
         except Exception:
-            self.store.release_run(session_id)
+            self._release_run(session_id)
             raise
 
         return self._run_loop(session)
@@ -90,10 +109,7 @@ class AgentEngine:
         ``waiting_for_user`` and an empty string is returned (caller must
         send a new user message).
         """
-        if not self.store.try_acquire_run(session_id):
-            raise ConcurrentRunError(
-                f"Session {session_id} already has an active run."
-            )
+        self._acquire_run(session_id)
 
         try:
             session = self._require_session(session_id)
@@ -122,7 +138,7 @@ class AgentEngine:
                     self._transition(session, SessionState.waiting_for_user)
                     session.error_message = ""
                     self.store.save(session)
-                    self.store.release_run(session_id)
+                    self._release_run(session_id)
                     return ""
             else:
                 # Normal continuation from a paused-but-healthy state.
@@ -130,7 +146,7 @@ class AgentEngine:
                 self._transition(session, SessionState.running)
                 self.store.save(session)
         except Exception:
-            self.store.release_run(session_id)
+            self._release_run(session_id)
             raise
 
         return self._run_loop(session)
@@ -145,10 +161,7 @@ class AgentEngine:
           "[confirm_required] name(args)"  — tool paused for confirmation
           final assistant text             — last event
         """
-        if not self.store.try_acquire_run(session_id):
-            raise ConcurrentRunError(
-                f"Session {session_id} already has an active run."
-            )
+        self._acquire_run(session_id)
         try:
             session = self._require_session(session_id)
             self._assert_can_run(session)
@@ -157,7 +170,7 @@ class AgentEngine:
             self._transition(session, SessionState.running)
             self.store.save(session)
         except Exception:
-            self.store.release_run(session_id)
+            self._release_run(session_id)
             raise
 
         try:
@@ -170,7 +183,7 @@ class AgentEngine:
             self.store.save(session)
             raise
         finally:
-            self.store.release_run(session_id)
+            self._release_run(session_id)
 
         session = self.store.get(session.id)
         if session.state == SessionState.running:
@@ -184,10 +197,7 @@ class AgentEngine:
         approved=True  — execute the pending tools and continue the loop.
         approved=False — inject rejection results and continue the loop.
         """
-        if not self.store.try_acquire_run(session_id):
-            raise ConcurrentRunError(
-                f"Session {session_id} already has an active run."
-            )
+        self._acquire_run(session_id)
         try:
             session = self._require_session(session_id)
             if session.state != SessionState.waiting_for_confirmation:
@@ -220,7 +230,7 @@ class AgentEngine:
             session.messages.append(Message.tool_result_msg(results))
             self.store.save(session)
         except Exception:
-            self.store.release_run(session_id)
+            self._release_run(session_id)
             raise
 
         return self._run_loop(session)
@@ -244,7 +254,7 @@ class AgentEngine:
             self.store.save(session)
             raise
         finally:
-            self.store.release_run(session.id)
+            self._release_run(session.id)
 
         session = self.store.get(session.id)
         if session.state == SessionState.running:
@@ -277,6 +287,8 @@ class AgentEngine:
             session = self.store.get(session.id)
             if session.cancelled:
                 log.info("Session %s cancelled at iteration %d", session.id, iteration)
+                _emit("loop.cancelled", Outcome.blocked,
+                      session_id=session.id, iteration=iteration)
                 self._transition(session, SessionState.finished)
                 self.store.save(session)
                 return
@@ -285,6 +297,9 @@ class AgentEngine:
             tool_schemas = self.tools.all_schemas()
 
             log.debug("Session %s iteration %d (%d tools)", session.id, iteration, len(tool_schemas))
+            _emit("loop.iteration.start", Outcome.executed,
+                  session_id=session.id, iteration=iteration,
+                  tool_count=len(tool_schemas))
 
             # 1. Call the model
             llm_response = self.llm.complete(session.messages, tool_schemas)
@@ -300,8 +315,11 @@ class AgentEngine:
             # Checkpoint: we know what the model said
             self._save_checkpoint(session, iteration, LABEL_POST_LLM)
 
-            # 3. No tool calls → done
+            # 3. No tool calls → final answer; loop exits cleanly
             if not llm_response.has_tool_calls:
+                _emit("loop.final_answer", Outcome.condition_unsatisfied,
+                      session_id=session.id, iteration=iteration,
+                      content_length=len(llm_response.content))
                 yield llm_response.content
                 return
 
@@ -317,6 +335,9 @@ class AgentEngine:
                         "Session %s cancelled between tools at iteration %d",
                         session.id, iteration,
                     )
+                    _emit("loop.cancelled_between_tools", Outcome.blocked,
+                          session_id=session.id, iteration=iteration,
+                          pending_tool=tc.name)
                     self._transition(session, SessionState.finished)
                     self.store.save(session)
                     return
@@ -343,6 +364,12 @@ class AgentEngine:
 
             # 5. If any tools need confirmation, pause the loop
             if needs_confirmation:
+                _emit(
+                    "loop.confirmation_pause", Outcome.blocked,
+                    session_id=session.id, iteration=iteration,
+                    pending_count=len(needs_confirmation),
+                    pending_tools=[tc.name for tc in needs_confirmation],
+                )
                 if results:
                     session.messages.append(Message.tool_result_msg(results))
                 session.pending_confirmation = needs_confirmation
@@ -358,6 +385,8 @@ class AgentEngine:
             self._save_checkpoint(session, iteration, LABEL_POST_TOOLS)
             # continue loop
 
+        _emit("loop.max_iterations_exceeded", Outcome.error,
+              session_id=session.id, max_iterations=MAX_ITERATIONS)
         raise RuntimeError(
             f"Session {session.id} exceeded MAX_ITERATIONS ({MAX_ITERATIONS})"
         )
@@ -401,4 +430,10 @@ class AgentEngine:
     @staticmethod
     def _transition(session: Session, new_state: SessionState) -> None:
         log.debug("Session %s: %s → %s", session.id, session.state, new_state)
+        _emit(
+            "session.transition", Outcome.executed,
+            session_id=session.id,
+            from_state=session.state.value,
+            to_state=new_state.value,
+        )
         session.state = new_state

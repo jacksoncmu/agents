@@ -16,6 +16,8 @@ import logging
 from dataclasses import dataclass, field
 from typing import Any, Callable
 
+from agent.telemetry import Outcome, emit as _emit
+
 log = logging.getLogger(__name__)
 
 
@@ -198,6 +200,7 @@ class ToolRegistry:
         tool = self.get(name)
         if tool is None:
             log.warning("Tool %r not found in registry", name)
+            _emit("tool.execute", Outcome.error, tool_name=name, reason="unknown_tool")
             return ExecutionResult(
                 output=f"Unknown tool: {name!r}",
                 error=True,
@@ -208,14 +211,21 @@ class ToolRegistry:
         if errors:
             msg = "; ".join(str(e) for e in errors)
             log.warning("Validation failed for tool %r: %s", name, msg)
+            _emit(
+                "tool.validate", Outcome.error,
+                tool_name=name,
+                errors=[{"param": e.param, "message": e.message} for e in errors],
+            )
             return ExecutionResult(
                 output=f"Validation failed: {msg}",
                 error=True,
             )
+        _emit("tool.validate", Outcome.executed, tool_name=name)
 
         # Confirmation gate — return early; engine decides what to do
         if tool.requires_confirmation:
             log.debug("Tool %r requires confirmation, deferring execution", name)
+            _emit("tool.confirmation_gate", Outcome.blocked, tool_name=name)
             return ExecutionResult(output="", requires_confirmation=True)
 
         return self._invoke(tool, arguments)
@@ -228,18 +238,31 @@ class ToolRegistry:
         """
         tool = self.get(name)
         if tool is None:
+            _emit("tool.execute", Outcome.error, tool_name=name, reason="unknown_tool", confirmed=True)
             return ExecutionResult(output=f"Unknown tool: {name!r}", error=True)
 
         errors = tool.validate(arguments)
         if errors:
             msg = "; ".join(str(e) for e in errors)
+            _emit(
+                "tool.validate", Outcome.error,
+                tool_name=name,
+                errors=[{"param": e.param, "message": e.message} for e in errors],
+                confirmed=True,
+            )
             return ExecutionResult(output=f"Validation failed: {msg}", error=True)
 
-        return self._invoke(tool, arguments)
+        _emit("tool.validate", Outcome.executed, tool_name=name, confirmed=True)
+        return self._invoke(tool, arguments, confirmed=True)
 
     # -- internal ----------------------------------------------------------
 
-    def _invoke(self, tool: ToolDefinition, arguments: dict[str, Any]) -> ExecutionResult:
+    def _invoke(
+        self,
+        tool: ToolDefinition,
+        arguments: dict[str, Any],
+        confirmed: bool = False,
+    ) -> ExecutionResult:
         ctx = ToolContext()
         try:
             sig = inspect.signature(tool.handler)
@@ -249,9 +272,16 @@ class ToolRegistry:
                 raw = tool.handler(**arguments)
         except Exception as exc:
             log.exception("Tool %r raised during execution: %s", tool.name, exc)
+            _emit(
+                "tool.execute", Outcome.error,
+                tool_name=tool.name,
+                error=str(exc),
+                confirmed=confirmed,
+            )
             return ExecutionResult(
                 output=f"Tool execution failed: {exc}",
                 error=True,
                 logs=ctx.logs,
             )
+        _emit("tool.execute", Outcome.executed, tool_name=tool.name, confirmed=confirmed)
         return ExecutionResult(output=str(raw), logs=ctx.logs)
