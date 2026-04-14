@@ -21,6 +21,10 @@ log = logging.getLogger(__name__)
 MAX_ITERATIONS = 50  # safety ceiling to prevent infinite loops
 
 
+class ConcurrentRunError(RuntimeError):
+    """Raised when a run is requested but another run already owns the session."""
+
+
 class AgentEngine:
     def __init__(
         self,
@@ -54,12 +58,20 @@ class AgentEngine:
         ``waiting_for_confirmation`` and this method returns an empty string.
         Call ``resume()`` to continue.
         """
-        session = self._require_session(session_id)
-        self._assert_can_run(session)
+        if not self.store.try_acquire_run(session_id):
+            raise ConcurrentRunError(
+                f"Session {session_id} already has an active run."
+            )
+        try:
+            session = self._require_session(session_id)
+            self._assert_can_run(session)
 
-        session.messages.append(Message.user(user_message))
-        self._transition(session, SessionState.running)
-        self.store.save(session)
+            session.messages.append(Message.user(user_message))
+            self._transition(session, SessionState.running)
+            self.store.save(session)
+        except Exception:
+            self.store.release_run(session_id)
+            raise
 
         return self._run_loop(session)
 
@@ -78,38 +90,48 @@ class AgentEngine:
         ``waiting_for_user`` and an empty string is returned (caller must
         send a new user message).
         """
-        session = self._require_session(session_id)
+        if not self.store.try_acquire_run(session_id):
+            raise ConcurrentRunError(
+                f"Session {session_id} already has an active run."
+            )
 
-        if session.state == SessionState.running:
-            # Recovery path: session was interrupted mid-loop.  Find the
-            # latest post_tools checkpoint (safest resume point) and truncate
-            # messages back to that state.  Skip _assert_can_run because the
-            # running state is expected here.
-            all_cps = self.store.list_checkpoints(session_id)
-            post_tools_cps = [cp for cp in all_cps if cp.label == LABEL_POST_TOOLS]
-            if post_tools_cps:
-                cp = post_tools_cps[-1]
-                log.info(
-                    "Recovering session %s from checkpoint %s (msg_count=%d)",
-                    session_id, cp.id, cp.message_count,
-                )
-                session.messages = session.messages[: cp.message_count]
-                self.store.save(session)
+        try:
+            session = self._require_session(session_id)
+
+            if session.state == SessionState.running:
+                # Recovery path: session was interrupted mid-loop.  Find the
+                # latest post_tools checkpoint (safest resume point) and truncate
+                # messages back to that state.  Skip _assert_can_run because the
+                # running state is expected here.
+                all_cps = self.store.list_checkpoints(session_id)
+                post_tools_cps = [cp for cp in all_cps if cp.label == LABEL_POST_TOOLS]
+                if post_tools_cps:
+                    cp = post_tools_cps[-1]
+                    log.info(
+                        "Recovering session %s from checkpoint %s (msg_count=%d)",
+                        session_id, cp.id, cp.message_count,
+                    )
+                    session.messages = session.messages[: cp.message_count]
+                    self.store.save(session)
+                else:
+                    log.warning(
+                        "Session %s in running state with no post_tools checkpoint; "
+                        "resetting to waiting_for_user",
+                        session_id,
+                    )
+                    self._transition(session, SessionState.waiting_for_user)
+                    session.error_message = ""
+                    self.store.save(session)
+                    self.store.release_run(session_id)
+                    return ""
             else:
-                log.warning(
-                    "Session %s in running state with no post_tools checkpoint; "
-                    "resetting to waiting_for_user",
-                    session_id,
-                )
-                self._transition(session, SessionState.waiting_for_user)
-                session.error_message = ""
+                # Normal continuation from a paused-but-healthy state.
+                self._assert_can_run(session)
+                self._transition(session, SessionState.running)
                 self.store.save(session)
-                return ""
-        else:
-            # Normal continuation from a paused-but-healthy state.
-            self._assert_can_run(session)
-            self._transition(session, SessionState.running)
-            self.store.save(session)
+        except Exception:
+            self.store.release_run(session_id)
+            raise
 
         return self._run_loop(session)
 
@@ -123,12 +145,20 @@ class AgentEngine:
           "[confirm_required] name(args)"  — tool paused for confirmation
           final assistant text             — last event
         """
-        session = self._require_session(session_id)
-        self._assert_can_run(session)
+        if not self.store.try_acquire_run(session_id):
+            raise ConcurrentRunError(
+                f"Session {session_id} already has an active run."
+            )
+        try:
+            session = self._require_session(session_id)
+            self._assert_can_run(session)
 
-        session.messages.append(Message.user(user_message))
-        self._transition(session, SessionState.running)
-        self.store.save(session)
+            session.messages.append(Message.user(user_message))
+            self._transition(session, SessionState.running)
+            self.store.save(session)
+        except Exception:
+            self.store.release_run(session_id)
+            raise
 
         try:
             for event in self._react_loop_events(session):
@@ -139,6 +169,8 @@ class AgentEngine:
             session.error_message = str(exc)
             self.store.save(session)
             raise
+        finally:
+            self.store.release_run(session_id)
 
         session = self.store.get(session.id)
         if session.state == SessionState.running:
@@ -152,36 +184,44 @@ class AgentEngine:
         approved=True  — execute the pending tools and continue the loop.
         approved=False — inject rejection results and continue the loop.
         """
-        session = self._require_session(session_id)
-        if session.state != SessionState.waiting_for_confirmation:
-            raise RuntimeError(
-                f"Session {session_id} is not waiting for confirmation "
-                f"(state={session.state})"
+        if not self.store.try_acquire_run(session_id):
+            raise ConcurrentRunError(
+                f"Session {session_id} already has an active run."
             )
+        try:
+            session = self._require_session(session_id)
+            if session.state != SessionState.waiting_for_confirmation:
+                raise RuntimeError(
+                    f"Session {session_id} is not waiting for confirmation "
+                    f"(state={session.state})"
+                )
 
-        pending = list(session.pending_confirmation)
-        session.pending_confirmation = []
-        self._transition(session, SessionState.running)
-        self.store.save(session)
+            pending = list(session.pending_confirmation)
+            session.pending_confirmation = []
+            self._transition(session, SessionState.running)
+            self.store.save(session)
 
-        results: list[ToolResult] = []
-        for tc in pending:
-            if approved:
-                exec_result = self.tools.execute_confirmed(tc.name, tc.arguments)
-                results.append(ToolResult(
-                    tool_call_id=tc.id,
-                    content=exec_result.output,
-                    error=exec_result.error,
-                ))
-            else:
-                results.append(ToolResult(
-                    tool_call_id=tc.id,
-                    content="Action was not approved.",
-                    error=True,
-                ))
+            results: list[ToolResult] = []
+            for tc in pending:
+                if approved:
+                    exec_result = self.tools.execute_confirmed(tc.name, tc.arguments)
+                    results.append(ToolResult(
+                        tool_call_id=tc.id,
+                        content=exec_result.output,
+                        error=exec_result.error,
+                    ))
+                else:
+                    results.append(ToolResult(
+                        tool_call_id=tc.id,
+                        content="Action was not approved.",
+                        error=True,
+                    ))
 
-        session.messages.append(Message.tool_result_msg(results))
-        self.store.save(session)
+            session.messages.append(Message.tool_result_msg(results))
+            self.store.save(session)
+        except Exception:
+            self.store.release_run(session_id)
+            raise
 
         return self._run_loop(session)
 
@@ -190,7 +230,11 @@ class AgentEngine:
     # ------------------------------------------------------------------
 
     def _run_loop(self, session: Session) -> str:
-        """Enter the blocking ReAct loop; handle final state transitions."""
+        """Enter the blocking ReAct loop; handle final state transitions.
+
+        Always releases run ownership on exit — success, confirmation pause,
+        cancellation, or exception.
+        """
         try:
             final_text = self._react_loop(session)
         except Exception as exc:
@@ -199,6 +243,8 @@ class AgentEngine:
             session.error_message = str(exc)
             self.store.save(session)
             raise
+        finally:
+            self.store.release_run(session.id)
 
         session = self.store.get(session.id)
         if session.state == SessionState.running:
@@ -264,6 +310,17 @@ class AgentEngine:
             needs_confirmation: list[ToolCall] = []
 
             for tc in llm_response.tool_calls:
+                # Per-tool cancellation check — allows fast exit between tools
+                session = self.store.get(session.id)
+                if session.cancelled:
+                    log.info(
+                        "Session %s cancelled between tools at iteration %d",
+                        session.id, iteration,
+                    )
+                    self._transition(session, SessionState.finished)
+                    self.store.save(session)
+                    return
+
                 yield f"[tool] {tc.name}({tc.arguments})"
                 exec_result: ExecutionResult = self.tools.execute(tc.name, tc.arguments)
 

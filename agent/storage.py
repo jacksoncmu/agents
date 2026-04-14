@@ -19,6 +19,7 @@ from __future__ import annotations
 import json
 import os
 import tempfile
+import threading
 import uuid
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
@@ -117,6 +118,46 @@ class SessionSummary:
 
 
 # ---------------------------------------------------------------------------
+# In-process run-ownership tracker (shared by all store implementations)
+# ---------------------------------------------------------------------------
+
+class _RunOwnership:
+    """
+    Tracks which sessions currently have an active engine run.
+
+    Uses a single ``threading.Lock`` to protect the ownership set, but holds
+    that lock for *microseconds* only — long enough to perform an atomic
+    check-and-set.  The actual work (LLM calls, tool execution) runs entirely
+    outside this lock.
+
+    This is process-local: ownership is not persisted.  After a process
+    restart every session is implicitly unowned; ``continue_run`` handles
+    crash-recovery via checkpoints.
+    """
+
+    def __init__(self) -> None:
+        self._guard = threading.Lock()
+        self._owned: set[str] = set()
+
+    def try_acquire(self, session_id: str) -> bool:
+        """Atomically claim ownership.  Returns True if claimed, False if already owned."""
+        with self._guard:
+            if session_id in self._owned:
+                return False
+            self._owned.add(session_id)
+            return True
+
+    def release(self, session_id: str) -> None:
+        """Release ownership unconditionally (safe to call even if not owned)."""
+        with self._guard:
+            self._owned.discard(session_id)
+
+    def is_owned(self, session_id: str) -> bool:
+        with self._guard:
+            return session_id in self._owned
+
+
+# ---------------------------------------------------------------------------
 # Abstract interface
 # ---------------------------------------------------------------------------
 
@@ -168,6 +209,32 @@ class SessionStore(ABC):
         """Atomically set the cancellation flag without a full session round-trip."""
         ...
 
+    # -- Run ownership (in-process, not persisted) ---------------------------
+
+    @abstractmethod
+    def try_acquire_run(self, session_id: str) -> bool:
+        """
+        Atomically claim run ownership for *session_id*.
+
+        Returns True if ownership was acquired (caller may proceed).
+        Returns False if another run is already active (caller must reject).
+
+        The implementation must hold its internal mutex for the minimum time
+        needed to perform the check-and-set — never while doing I/O or
+        long-running work.
+        """
+        ...
+
+    @abstractmethod
+    def release_run(self, session_id: str) -> None:
+        """Release run ownership.  Safe to call even when not owned (idempotent)."""
+        ...
+
+    @abstractmethod
+    def is_run_owned(self, session_id: str) -> bool:
+        """Return True if a run currently owns this session."""
+        ...
+
     # -- Checkpoints ---------------------------------------------------------
 
     @abstractmethod
@@ -194,6 +261,7 @@ class InMemoryStore(SessionStore):
         self._sessions: dict[str, Session] = {}
         # session_id → ordered list of checkpoints (oldest first)
         self._checkpoints: dict[str, list[Checkpoint]] = {}
+        self._ownership = _RunOwnership()
 
     # -- Session CRUD -------------------------------------------------------
 
@@ -256,6 +324,17 @@ class InMemoryStore(SessionStore):
             s.cancelled = value
             s.updated_at = datetime.utcnow()
 
+    # -- Run ownership -------------------------------------------------------
+
+    def try_acquire_run(self, session_id: str) -> bool:
+        return self._ownership.try_acquire(session_id)
+
+    def release_run(self, session_id: str) -> None:
+        self._ownership.release(session_id)
+
+    def is_run_owned(self, session_id: str) -> bool:
+        return self._ownership.is_owned(session_id)
+
     # -- Checkpoints ---------------------------------------------------------
 
     def save_checkpoint(self, cp: Checkpoint) -> None:
@@ -296,6 +375,7 @@ class FileStore(SessionStore):
         self._base = Path(base_dir)
         self._sessions_dir.mkdir(parents=True, exist_ok=True)
         self._checkpoints_dir.mkdir(parents=True, exist_ok=True)
+        self._ownership = _RunOwnership()
 
     @property
     def _sessions_dir(self) -> Path:
@@ -381,6 +461,17 @@ class FileStore(SessionStore):
         if s is not None:
             s.cancelled = value
             self.save(s)
+
+    # -- Run ownership -------------------------------------------------------
+
+    def try_acquire_run(self, session_id: str) -> bool:
+        return self._ownership.try_acquire(session_id)
+
+    def release_run(self, session_id: str) -> None:
+        self._ownership.release(session_id)
+
+    def is_run_owned(self, session_id: str) -> bool:
+        return self._ownership.is_owned(session_id)
 
     # -- Checkpoints ---------------------------------------------------------
 
