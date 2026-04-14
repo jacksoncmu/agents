@@ -6,12 +6,13 @@ from typing import Iterator
 
 from agent.llm.base import LLMProvider
 from agent.storage import SessionStore
-from agent.tools import ToolRegistry
+from agent.tools import ExecutionResult, ToolRegistry
 from agent.types import (
     Message,
     MessageRole,
     Session,
     SessionState,
+    ToolCall,
     ToolResult,
 )
 
@@ -51,13 +52,13 @@ class AgentEngine:
         Accept a user message, run the ReAct loop to completion, and return
         the final assistant text.
 
-        Raises RuntimeError if the session is in a terminal or incompatible
-        state.
+        If a tool requires confirmation the loop pauses: the session moves to
+        ``waiting_for_confirmation`` and this method returns an empty string.
+        Call ``resume()`` to continue.
         """
         session = self._require_session(session_id)
         self._assert_can_run(session)
 
-        # Append user turn
         session.messages.append(Message.user(user_message))
         self._transition(session, SessionState.running)
         self.store.save(session)
@@ -71,7 +72,6 @@ class AgentEngine:
             self.store.save(session)
             raise
 
-        # Re-read: the loop may have set a terminal state (e.g. cancellation).
         session = self.store.get(session.id)
         if session.state == SessionState.running:
             self._transition(session, SessionState.waiting_for_user)
@@ -80,8 +80,13 @@ class AgentEngine:
 
     def stream_run(self, session_id: str, user_message: str) -> Iterator[str]:
         """
-        Thin generator wrapper around run() that yields progress lines.
-        Useful for the CLI without pulling in async machinery.
+        Generator variant of run().  Yields progress events:
+          "[tool] name(args)"      — tool is about to execute
+          "[result] output"        — tool returned successfully
+          "[result:error] output"  — tool returned an error
+          "[log] name: message"    — structured log from the tool handler
+          "[confirm_required] name(args)"  — tool paused for confirmation
+          final assistant text     — last event
         """
         session = self._require_session(session_id)
         self._assert_can_run(session)
@@ -100,47 +105,101 @@ class AgentEngine:
             self.store.save(session)
             raise
 
-        # Re-read: the loop may have set the state to finished (e.g. cancellation).
         session = self.store.get(session.id)
         if session.state == SessionState.running:
             self._transition(session, SessionState.waiting_for_user)
             self.store.save(session)
+
+    def resume(self, session_id: str, *, approved: bool) -> str:
+        """
+        Resume after ``waiting_for_confirmation``.
+
+        approved=True  — execute the pending tools and continue the loop.
+        approved=False — inject rejection results and continue the loop.
+        """
+        session = self._require_session(session_id)
+        if session.state != SessionState.waiting_for_confirmation:
+            raise RuntimeError(
+                f"Session {session_id} is not waiting for confirmation "
+                f"(state={session.state})"
+            )
+
+        pending = list(session.pending_confirmation)
+        session.pending_confirmation = []
+        self._transition(session, SessionState.running)
+        self.store.save(session)
+
+        results: list[ToolResult] = []
+        for tc in pending:
+            if approved:
+                exec_result = self.tools.execute_confirmed(tc.name, tc.arguments)
+                results.append(ToolResult(
+                    tool_call_id=tc.id,
+                    content=exec_result.output,
+                    error=exec_result.error,
+                ))
+            else:
+                results.append(ToolResult(
+                    tool_call_id=tc.id,
+                    content="Action was not approved.",
+                    error=True,
+                ))
+
+        session.messages.append(Message.tool_result_msg(results))
+        self.store.save(session)
+
+        try:
+            final_text = self._react_loop(session)
+        except Exception as exc:
+            session = self.store.get(session.id)
+            self._transition(session, SessionState.error)
+            session.error_message = str(exc)
+            self.store.save(session)
+            raise
+
+        session = self.store.get(session.id)
+        if session.state == SessionState.running:
+            self._transition(session, SessionState.waiting_for_user)
+            self.store.save(session)
+        return final_text
 
     # ------------------------------------------------------------------
     # Internal loop
     # ------------------------------------------------------------------
 
     def _react_loop(self, session: Session) -> str:
-        """Blocking ReAct loop; returns the final assistant text."""
+        """Blocking ReAct loop; returns the final assistant text (may be empty
+        if the loop paused for confirmation)."""
         final_text = ""
         for event in self._react_loop_events(session):
-            final_text = event  # last event is the final answer
+            final_text = event
         return final_text
 
     def _react_loop_events(self, session: Session) -> Iterator[str]:
         """
-        Core loop generator.  Yields string events:
-          - "[tool] <name>(<args>)"  when a tool is called
-          - "[result] <content>"     after a tool returns
-          - the final assistant text when done
-        """
-        tool_schemas = self.tools.all_schemas()
+        Core loop generator.
 
+        Tool schemas are fetched fresh at the top of every iteration so that
+        tools registered between turns are immediately visible.
+        """
         for iteration in range(MAX_ITERATIONS):
             # --- cancellation check (required at top of every iteration) ---
-            session = self.store.get(session.id)  # re-read in case cancelled
+            session = self.store.get(session.id)
             if session.cancelled:
                 log.info("Session %s cancelled at iteration %d", session.id, iteration)
                 self._transition(session, SessionState.finished)
                 self.store.save(session)
                 return
 
-            log.debug("Session %s iteration %d", session.id, iteration)
+            # Refresh tool schemas each iteration — dynamic visibility
+            tool_schemas = self.tools.all_schemas()
+
+            log.debug("Session %s iteration %d (%d tools)", session.id, iteration, len(tool_schemas))
 
             # 1. Call the model
             llm_response = self.llm.complete(session.messages, tool_schemas)
 
-            # 2. Append assistant message (content + any tool calls)
+            # 2. Append assistant message
             assistant_msg = Message.assistant(
                 content=llm_response.content,
                 tool_calls=llm_response.tool_calls,
@@ -148,36 +207,51 @@ class AgentEngine:
             session.messages.append(assistant_msg)
             self.store.save(session)
 
-            # 3. No tool calls → we are done; leave state transition to the caller
+            # 3. No tool calls → done
             if not llm_response.has_tool_calls:
-                self.store.save(session)
                 yield llm_response.content
                 return
 
-            # 4. Execute tool calls and collect results
+            # 4. Execute tool calls
             results: list[ToolResult] = []
+            needs_confirmation: list[ToolCall] = []
+
             for tc in llm_response.tool_calls:
-                event_label = f"[tool] {tc.name}({tc.arguments})"
-                log.debug(event_label)
-                yield event_label
+                yield f"[tool] {tc.name}({tc.arguments})"
+                exec_result: ExecutionResult = self.tools.execute(tc.name, tc.arguments)
 
-                try:
-                    output = self.tools.execute(tc.name, tc.arguments)
-                    results.append(ToolResult(tool_call_id=tc.id, content=output))
-                    yield f"[result] {output}"
-                except Exception as exc:
-                    error_text = f"Error: {exc}"
-                    results.append(
-                        ToolResult(tool_call_id=tc.id, content=error_text, error=True)
-                    )
-                    yield f"[result:error] {error_text}"
+                # Emit any structured logs from the handler
+                for line in exec_result.logs:
+                    yield f"[log] {tc.name}: {line}"
 
-            # 5. Append tool_result message *immediately* after assistant message
+                if exec_result.requires_confirmation:
+                    log.info("Tool %r requires confirmation in session %s", tc.name, session.id)
+                    yield f"[confirm_required] {tc.name}({tc.arguments})"
+                    needs_confirmation.append(tc)
+                else:
+                    tag = "[result:error]" if exec_result.error else "[result]"
+                    yield f"{tag} {exec_result.output}"
+                    results.append(ToolResult(
+                        tool_call_id=tc.id,
+                        content=exec_result.output,
+                        error=exec_result.error,
+                    ))
+
+            # 5. If any tools need confirmation, pause the loop
+            if needs_confirmation:
+                # Append results from tools that DID execute (if any)
+                if results:
+                    session.messages.append(Message.tool_result_msg(results))
+                session.pending_confirmation = needs_confirmation
+                self._transition(session, SessionState.waiting_for_confirmation)
+                self.store.save(session)
+                return  # caller must call resume()
+
+            # 6. Append all tool results immediately after the assistant message
             session.messages.append(Message.tool_result_msg(results))
             self.store.save(session)
             # continue loop
 
-        # Exceeded MAX_ITERATIONS
         raise RuntimeError(
             f"Session {session.id} exceeded MAX_ITERATIONS ({MAX_ITERATIONS})"
         )
@@ -194,13 +268,15 @@ class AgentEngine:
 
     @staticmethod
     def _assert_can_run(session: Session) -> None:
-        if session.state in (SessionState.running,):
-            raise RuntimeError(
-                f"Session {session.id} is already running."
-            )
+        if session.state == SessionState.running:
+            raise RuntimeError(f"Session {session.id} is already running.")
         if session.state == SessionState.error:
             raise RuntimeError(
                 f"Session {session.id} is in error state: {session.error_message}"
+            )
+        if session.state == SessionState.waiting_for_confirmation:
+            raise RuntimeError(
+                f"Session {session.id} is waiting for confirmation; call resume() instead."
             )
 
     @staticmethod

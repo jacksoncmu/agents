@@ -74,6 +74,9 @@ class Session:
     cancelled: bool = False
     metadata: dict[str, Any] = field(default_factory=dict)
     error_message: str = ""
+    # Tool calls deferred pending human confirmation.  Populated when the
+    # engine transitions to waiting_for_confirmation; cleared on resume.
+    pending_confirmation: list[ToolCall] = field(default_factory=list)
 
     @staticmethod
     def new() -> "Session":
