@@ -4,6 +4,7 @@ from __future__ import annotations
 import logging
 from typing import Iterator
 
+from agent.compression import ContextCompressor
 from agent.llm.base import LLMProvider
 from agent.storage import LABEL_POST_LLM, LABEL_POST_TOOLS, Checkpoint, SessionStore
 from agent.telemetry import Outcome, emit as _emit
@@ -32,10 +33,12 @@ class AgentEngine:
         store: SessionStore,
         llm: LLMProvider,
         tools: ToolRegistry,
+        compressor: ContextCompressor | None = None,
     ) -> None:
         self.store = store
         self.llm = llm
         self.tools = tools
+        self._compressor = compressor
 
     # ------------------------------------------------------------------
     # Ownership helpers (emit telemetry + delegate to store)
@@ -300,6 +303,13 @@ class AgentEngine:
             _emit("loop.iteration.start", Outcome.executed,
                   session_id=session.id, iteration=iteration,
                   tool_count=len(tool_schemas))
+
+            # Optional context compression — keep messages within the window
+            if self._compressor is not None:
+                compressed = self._compressor.compress(session.messages, session.id)
+                if compressed is not session.messages:
+                    session.messages = compressed
+                    self.store.save(session)
 
             # 1. Call the model
             llm_response = self.llm.complete(session.messages, tool_schemas)
