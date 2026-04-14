@@ -67,3 +67,22 @@ class ModelConfig:
             temperature=temperature,
             extra=extra,
         )
+
+    @staticmethod
+    def openai(
+        model: str = "gpt-4o",
+        *,
+        api_key: str = "",
+        max_tokens: int = 4096,
+        temperature: float | None = None,
+        **extra: Any,
+    ) -> "ModelConfig":
+        """Convenience constructor for OpenAI models."""
+        return ModelConfig(
+            provider="openai",
+            model=model,
+            api_key=api_key,
+            max_tokens=max_tokens,
+            temperature=temperature,
+            extra=extra,
+        )

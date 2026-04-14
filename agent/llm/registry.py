@@ -32,7 +32,9 @@ def provider_from_config(config: ModelConfig) -> LLMProvider:
 
 def _register_builtins() -> None:
     from agent.llm.anthropic import AnthropicProvider  # noqa: PLC0415
+    from agent.llm.openai import OpenAIProvider        # noqa: PLC0415
     register_provider("anthropic", AnthropicProvider)
+    register_provider("openai", OpenAIProvider)
 
 
 _register_builtins()
