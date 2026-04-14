@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import uuid
 from dataclasses import dataclass, field
+from datetime import datetime
 from enum import Enum
 from typing import Any
 
@@ -77,6 +78,8 @@ class Session:
     # Tool calls deferred pending human confirmation.  Populated when the
     # engine transitions to waiting_for_confirmation; cleared on resume.
     pending_confirmation: list[ToolCall] = field(default_factory=list)
+    created_at: datetime = field(default_factory=datetime.utcnow)
+    updated_at: datetime = field(default_factory=datetime.utcnow)
 
     @staticmethod
     def new() -> "Session":
