@@ -1,1 +1,3 @@
 pytest>=8.0
+# Real provider SDKs — install only what you use
+anthropic>=0.40.0
