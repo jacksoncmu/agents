@@ -6,6 +6,7 @@ from typing import Iterator
 
 from agent.compression import ContextCompressor
 from agent.llm.base import LLMProvider
+from agent.loop_detector import InterventionQueue, LoopDetector
 from agent.storage import LABEL_POST_LLM, LABEL_POST_TOOLS, Checkpoint, SessionStore
 from agent.telemetry import Outcome, emit as _emit
 from agent.tools import ExecutionResult, ToolRegistry
@@ -34,11 +35,14 @@ class AgentEngine:
         llm: LLMProvider,
         tools: ToolRegistry,
         compressor: ContextCompressor | None = None,
+        loop_detector: LoopDetector | None = None,
     ) -> None:
         self.store = store
         self.llm = llm
         self.tools = tools
         self._compressor = compressor
+        self._loop_detector = loop_detector
+        self._intervention_queue = InterventionQueue()
 
     # ------------------------------------------------------------------
     # Ownership helpers (emit telemetry + delegate to store)
@@ -311,6 +315,20 @@ class AgentEngine:
                     session.messages = compressed
                     self.store.save(session)
 
+            # Flush any queued intervention messages (from previous iteration's
+            # loop detection).  Safe here: we are past the tool_result from the
+            # previous iteration and before the next LLM call.
+            flushed = self._intervention_queue.flush()
+            if flushed:
+                for msg in flushed:
+                    session.messages.append(msg)
+                self.store.save(session)
+                _emit(
+                    "loop.intervention_flushed", Outcome.executed,
+                    session_id=session.id, iteration=iteration,
+                    count=len(flushed),
+                )
+
             # 1. Call the model
             llm_response = self.llm.complete(session.messages, tool_schemas)
 
@@ -393,6 +411,18 @@ class AgentEngine:
 
             # Checkpoint: tool results persisted — safest resume point
             self._save_checkpoint(session, iteration, LABEL_POST_TOOLS)
+
+            # 7. Loop detection — check after tool_result is safely appended
+            if self._loop_detector is not None:
+                detection = self._loop_detector.check(
+                    session.messages,
+                    session_id=session.id,
+                    iteration=iteration,
+                )
+                if detection.detected:
+                    intervention = LoopDetector.make_intervention_message(detection)
+                    self._intervention_queue.enqueue(intervention)
+                    yield f"[loop_detected] {detection.reason}"
             # continue loop
 
         _emit("loop.max_iterations_exceeded", Outcome.error,

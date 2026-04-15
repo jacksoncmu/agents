@@ -1,0 +1,8 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python -m pytest --tb=short -q)",
+      "Bash(python -m pytest tests/test_loop_detection.py -v --tb=short)"
+    ]
+  }
+}
