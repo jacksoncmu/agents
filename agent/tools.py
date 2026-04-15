@@ -16,6 +16,7 @@ import logging
 from dataclasses import dataclass, field
 from typing import Any, Callable
 
+from agent.output_limiter import OutputLimiter
 from agent.telemetry import Outcome, emit as _emit
 
 log = logging.getLogger(__name__)
@@ -157,8 +158,9 @@ class ToolDefinition:
 # ---------------------------------------------------------------------------
 
 class ToolRegistry:
-    def __init__(self) -> None:
+    def __init__(self, output_limiter: OutputLimiter | None = None) -> None:
         self._tools: dict[str, ToolDefinition] = {}
+        self._output_limiter = output_limiter
 
     # -- registration -------------------------------------------------------
 
@@ -284,4 +286,7 @@ class ToolRegistry:
                 logs=ctx.logs,
             )
         _emit("tool.execute", Outcome.executed, tool_name=tool.name, confirmed=confirmed)
-        return ExecutionResult(output=str(raw), logs=ctx.logs)
+        output = str(raw)
+        if self._output_limiter is not None:
+            output = self._output_limiter.limit(tool.name, output)
+        return ExecutionResult(output=output, logs=ctx.logs)
