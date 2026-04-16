@@ -7,6 +7,7 @@ from typing import Iterator
 from agent.compression import ContextCompressor
 from agent.llm.base import LLMProvider
 from agent.loop_detector import InterventionQueue, LoopDetector
+from agent.policy import PolicyEngine, PolicyResult, PolicyVerdict
 from agent.storage import LABEL_POST_LLM, LABEL_POST_TOOLS, Checkpoint, SessionStore
 from agent.telemetry import Outcome, emit as _emit
 from agent.tools import ExecutionResult, ToolRegistry
@@ -36,12 +37,14 @@ class AgentEngine:
         tools: ToolRegistry,
         compressor: ContextCompressor | None = None,
         loop_detector: LoopDetector | None = None,
+        policy: PolicyEngine | None = None,
     ) -> None:
         self.store = store
         self.llm = llm
         self.tools = tools
         self._compressor = compressor
         self._loop_detector = loop_detector
+        self._policy = policy
         self._intervention_queue = InterventionQueue()
 
     # ------------------------------------------------------------------
@@ -370,6 +373,40 @@ class AgentEngine:
                     self.store.save(session)
                     return
 
+                # --- Policy evaluation (JIT, before execution) ---
+                _pr: PolicyResult = PolicyResult(verdict=PolicyVerdict.allow)
+                if self._policy is not None:
+                    _pr = self._policy.evaluate(tc, session.messages)
+                    _emit(
+                        "policy.evaluated", Outcome.executed,
+                        session_id=session.id, iteration=iteration,
+                        tool_name=tc.name, verdict=_pr.verdict.value,
+                    )
+
+                if _pr.verdict == PolicyVerdict.block:
+                    _block_content = _pr.block_message or _pr.reason or (
+                        f"Tool {tc.name!r} was blocked by policy."
+                    )
+                    results.append(ToolResult(
+                        tool_call_id=tc.id,
+                        content=_block_content,
+                        error=True,
+                    ))
+                    yield f"[policy:blocked] {tc.name}: {_pr.reason}"
+                    _emit("policy.blocked", Outcome.blocked,
+                          session_id=session.id, iteration=iteration,
+                          tool_name=tc.name, reason=_pr.reason)
+                    continue
+
+                if _pr.verdict == PolicyVerdict.require_confirmation:
+                    needs_confirmation.append(tc)
+                    yield f"[confirm_required] {tc.name}({tc.arguments})"
+                    _emit("policy.confirmation_required", Outcome.blocked,
+                          session_id=session.id, iteration=iteration,
+                          tool_name=tc.name, reason=_pr.reason)
+                    continue
+                # -------------------------------------------------
+
                 yield f"[tool] {tc.name}({tc.arguments})"
                 exec_result: ExecutionResult = self.tools.execute(tc.name, tc.arguments)
 
@@ -382,11 +419,18 @@ class AgentEngine:
                     yield f"[confirm_required] {tc.name}({tc.arguments})"
                     needs_confirmation.append(tc)
                 else:
+                    output = exec_result.output
+                    if _pr.verdict == PolicyVerdict.inject_reminder and _pr.reminder:
+                        output = f"[Policy reminder: {_pr.reminder}]\n\n{output}"
+                        yield f"[policy:reminder] {tc.name}: {_pr.reminder}"
+                        _emit("policy.reminder_injected", Outcome.executed,
+                              session_id=session.id, iteration=iteration,
+                              tool_name=tc.name)
                     tag = "[result:error]" if exec_result.error else "[result]"
-                    yield f"{tag} {exec_result.output}"
+                    yield f"{tag} {output}"
                     results.append(ToolResult(
                         tool_call_id=tc.id,
-                        content=exec_result.output,
+                        content=output,
                         error=exec_result.error,
                     ))
 
