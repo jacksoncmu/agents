@@ -45,9 +45,22 @@ class ModelConfig:
     temperature: float | None = None
     extra: dict[str, Any] = field(default_factory=dict)
 
+    # Reasoning / extended-thinking mode.
+    # When True each provider activates its chain-of-thought mechanism:
+    #   Anthropic → extended thinking  (budget_tokens = reasoning_budget_tokens)
+    #   OpenAI    → reasoning_effort="high"  (o-series models only)
+    # Off by default; enable per-scenario via with_reasoning() or scenario config.
+    reasoning_mode: bool = False
+    reasoning_budget_tokens: int = 8000
+
     def resolved_api_key(self, env_var: str) -> str:
         """Return api_key if set, otherwise the value of *env_var*."""
         return self.api_key or os.environ.get(env_var, "")
+
+    def with_reasoning(self, budget_tokens: int = 8000) -> "ModelConfig":
+        """Return a copy of this config with reasoning_mode enabled."""
+        from dataclasses import replace
+        return replace(self, reasoning_mode=True, reasoning_budget_tokens=budget_tokens)
 
     @staticmethod
     def anthropic(

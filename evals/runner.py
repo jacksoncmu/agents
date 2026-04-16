@@ -15,11 +15,16 @@ from __future__ import annotations
 import time
 from typing import Any
 
+from typing import Callable
+
+from agent.compression import ContextCompressor
 from agent.engine import AgentEngine
 from agent.llm.mock import MockProvider
+from agent.loop_detector import LoopDetector
+from agent.policy import PolicyEngine
 from agent.storage import InMemoryStore
 from agent.telemetry import InMemoryBackend, NullBackend, set_backend
-from agent.tools import ToolRegistry
+from agent.tools import ToolDefinition, ToolRegistry
 from agent.types import MessageRole, Session, SessionState
 
 from evals.schema import (
@@ -36,15 +41,47 @@ from evals.schema import (
 class EvalRunner:
     """Runs eval cases against the agent engine with a mock LLM."""
 
-    def run_all(self, cases: list[EvalCase], *, tags: list[str] | None = None) -> EvalSuiteResult:
+    def run_all(
+        self,
+        cases: list[EvalCase],
+        *,
+        tags: list[str] | None = None,
+        compressor: ContextCompressor | None = None,
+        loop_detector: LoopDetector | None = None,
+        policy: PolicyEngine | None = None,
+        tool_filter: Callable[[list[ToolDefinition]], list[ToolDefinition]] | None = None,
+    ) -> EvalSuiteResult:
         """Run all cases (or only those matching *tags*) and return aggregated results."""
         if tags:
             cases = [c for c in cases if any(t in c.tags for t in tags)]
-        results = [self.run_one(case) for case in cases]
+        results = [
+            self.run_one(
+                case,
+                compressor=compressor, loop_detector=loop_detector,
+                policy=policy, tool_filter=tool_filter,
+            )
+            for case in cases
+        ]
         return EvalSuiteResult(results=results)
 
-    def run_one(self, case: EvalCase) -> EvalResult:
-        """Execute a single eval case and return a detailed result."""
+    def run_one(
+        self,
+        case: EvalCase,
+        *,
+        compressor: ContextCompressor | None = None,
+        loop_detector: LoopDetector | None = None,
+        policy: PolicyEngine | None = None,
+        tool_filter: Callable[[list[ToolDefinition]], list[ToolDefinition]] | None = None,
+    ) -> EvalResult:
+        """Execute a single eval case and return a detailed result.
+
+        Optional keyword arguments override engine construction for ablation runs:
+          compressor    — ContextCompressor instance (or None to disable)
+          loop_detector — LoopDetector instance (or None to disable)
+          policy        — PolicyEngine instance (or None to disable)
+          tool_filter   — callable that receives case.tools and returns a
+                          (possibly reduced) list; use to ablate narrowed toolset
+        """
         # Set up telemetry capture
         tel_backend = InMemoryBackend()
         set_backend(tel_backend)
@@ -57,12 +94,16 @@ class EvalRunner:
         try:
             # Build engine
             registry = ToolRegistry()
-            for tool in case.tools:
+            tools_to_register = tool_filter(case.tools) if tool_filter else case.tools
+            for tool in tools_to_register:
                 registry.register(tool)
 
             store = InMemoryStore()
             llm = MockProvider(list(case.llm_responses))
-            engine = AgentEngine(store=store, llm=llm, tools=registry)
+            engine = AgentEngine(
+                store=store, llm=llm, tools=registry,
+                compressor=compressor, loop_detector=loop_detector, policy=policy,
+            )
 
             # Run
             sid = engine.create_session().id

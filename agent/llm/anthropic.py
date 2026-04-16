@@ -188,7 +188,13 @@ class AnthropicProvider(LLMProvider):
         provider_tools    = self._adapter.to_provider_tools(tools) if tools else []
 
         extra = self.config.extra
+        # thinking_cfg: explicit extra["thinking"] takes priority over reasoning_mode flag
         thinking_cfg = extra.get("thinking")
+        if thinking_cfg is None and self.config.reasoning_mode:
+            thinking_cfg = {
+                "type": "enabled",
+                "budget_tokens": self.config.reasoning_budget_tokens,
+            }
 
         call_kwargs: dict[str, Any] = {
             "model":      self.config.model,

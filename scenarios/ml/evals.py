@@ -647,10 +647,20 @@ def _build_leakage_case() -> EvalCase:
 # Registry
 # ---------------------------------------------------------------------------
 
-ML_EVAL_CASES: list[EvalCase] = [
-    _build_eda_case(),
-    _build_classification_case(),
-    _build_regression_case(),
-    _build_data_quality_case(),
-    _build_leakage_case(),
-]
+def build_ml_eval_cases() -> list[EvalCase]:
+    """Return a freshly built list of ML eval cases with new MLDataStore instances.
+
+    Call this instead of referencing ML_EVAL_CASES directly whenever you need
+    to run the cases more than once (e.g. across multiple ablation variants) —
+    each call creates independent stores so state does not bleed between runs.
+    """
+    return [
+        _build_eda_case(),
+        _build_classification_case(),
+        _build_regression_case(),
+        _build_data_quality_case(),
+        _build_leakage_case(),
+    ]
+
+
+ML_EVAL_CASES: list[EvalCase] = build_ml_eval_cases()

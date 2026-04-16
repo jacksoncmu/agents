@@ -230,8 +230,12 @@ class OpenAIProvider(LLMProvider):
         if self.config.temperature is not None:
             call_kwargs["temperature"] = self.config.temperature
 
-        if reasoning_effort := extra.get("reasoning_effort"):
-            call_kwargs["reasoning_effort"] = reasoning_effort
+        # reasoning_effort: explicit extra["reasoning_effort"] takes priority over flag
+        _reasoning_effort = extra.get("reasoning_effort")
+        if _reasoning_effort is None and self.config.reasoning_mode:
+            _reasoning_effort = "high"
+        if _reasoning_effort:
+            call_kwargs["reasoning_effort"] = _reasoning_effort
         if response_format := extra.get("response_format"):
             call_kwargs["response_format"] = response_format
 
